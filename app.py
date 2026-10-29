@@ -34,13 +34,6 @@ def get_secret(name, default):
 TEACHER_USERNAME = get_secret("TEACHER_USERNAME", "teacher")
 TEACHER_PASSWORD = get_secret("TEACHER_PASSWORD", "teacher123")
 
-# If DATABASE_URL is set (Supabase / Neon Postgres), the app uses it and the
-# data is permanent. Otherwise it uses a local SQLite file.
-DATABASE_URL = str(get_secret("DATABASE_URL", "") or "").strip()
-USE_PG = bool(DATABASE_URL)
-PK_TYPE = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
-NUM_TYPE = "DOUBLE PRECISION" if USE_PG else "REAL"
-
 # Students must not see the model answer.
 PUBLIC_COLUMNS = [
     "id", "student_name", "roll_number", "exam_name", "subject",
@@ -178,45 +171,18 @@ def fmt(n):
 
 # ---------------- DATABASE ----------------
 
-class Connection:
-    """Small wrapper so the same SQL works on SQLite (local) and Postgres (cloud)."""
-
-    def __init__(self):
-        if USE_PG:
-            import psycopg
-            from psycopg.rows import dict_row
-            self._conn = psycopg.connect(
-                DATABASE_URL,
-                row_factory=dict_row,
-                connect_timeout=15,
-                prepare_threshold=None,
-            )
-        else:
-            self._conn = sqlite3.connect(DB_PATH, timeout=20)
-            self._conn.row_factory = sqlite3.Row
-
-    def execute(self, sql, params=()):
-        if USE_PG:
-            sql = sql.replace("?", "%s")
-        return self._conn.execute(sql, params)
-
-    def commit(self):
-        self._conn.commit()
-
-    def close(self):
-        self._conn.close()
-
-
 def get_connection():
-    return Connection()
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def initialize_database():
     conn = get_connection()
 
-    conn.execute(f"""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS answer_sheet_results (
-            id {PK_TYPE},
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_name TEXT NOT NULL,
             roll_number TEXT NOT NULL,
             exam_name TEXT NOT NULL,
@@ -224,18 +190,16 @@ def initialize_database():
             question TEXT NOT NULL,
             model_answer TEXT NOT NULL,
             student_answer TEXT NOT NULL,
-            max_marks {NUM_TYPE} NOT NULL,
-            similarity {NUM_TYPE} NOT NULL,
-            suggested_marks {NUM_TYPE} NOT NULL,
-            created_at TEXT NOT NULL,
-            final_marks {NUM_TYPE} DEFAULT NULL,
-            teacher_feedback TEXT DEFAULT ''
+            max_marks REAL NOT NULL,
+            similarity REAL NOT NULL,
+            suggested_marks REAL NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
 
-    conn.execute(f"""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS answer_sheet_rechecks (
-            id {PK_TYPE},
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             result_id INTEGER NOT NULL,
             reason TEXT NOT NULL,
             status TEXT DEFAULT 'Pending',
@@ -247,26 +211,24 @@ def initialize_database():
         )
     """)
 
-    if not USE_PG:
-        # Older local SQLite files may be missing the newer columns.
-        result_columns = {
-            row["name"]
-            for row in conn.execute(
-                "PRAGMA table_info(answer_sheet_results)"
-            ).fetchall()
-        }
+    result_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(answer_sheet_results)"
+        ).fetchall()
+    }
 
-        if "final_marks" not in result_columns:
-            conn.execute("""
-                ALTER TABLE answer_sheet_results
-                ADD COLUMN final_marks REAL DEFAULT NULL
-            """)
+    if "final_marks" not in result_columns:
+        conn.execute("""
+            ALTER TABLE answer_sheet_results
+            ADD COLUMN final_marks REAL DEFAULT NULL
+        """)
 
-        if "teacher_feedback" not in result_columns:
-            conn.execute("""
-                ALTER TABLE answer_sheet_results
-                ADD COLUMN teacher_feedback TEXT DEFAULT ''
-            """)
+    if "teacher_feedback" not in result_columns:
+        conn.execute("""
+            ALTER TABLE answer_sheet_results
+            ADD COLUMN teacher_feedback TEXT DEFAULT ''
+        """)
 
     conn.commit()
     conn.close()
@@ -303,19 +265,16 @@ def get_results_by_roll(roll_number):
     return [dict(row) for row in rows]
 
 
-def insert_result(conn, data, created_at=None, final_marks=None,
-                  teacher_feedback=""):
-    """Inserts one result row and returns its new id."""
-    sql = """
+def save_result(data):
+    conn = get_connection()
+    cursor = conn.execute("""
         INSERT INTO answer_sheet_results (
             student_name, roll_number, exam_name, subject,
             question, model_answer, student_answer, max_marks,
-            similarity, suggested_marks, final_marks, teacher_feedback,
-            created_at
+            similarity, suggested_marks, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    params = (
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
         data["student_name"],
         data["roll_number"],
         data["exam_name"],
@@ -326,91 +285,12 @@ def insert_result(conn, data, created_at=None, final_marks=None,
         data["max_marks"],
         data["similarity"],
         data["suggested_marks"],
-        final_marks,
-        teacher_feedback,
-        created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
-    if USE_PG:
-        row = conn.execute(sql + " RETURNING id", params).fetchone()
-        return row["id"]
-    return conn.execute(sql, params).lastrowid
-
-
-def save_result(data):
-    conn = get_connection()
-    try:
-        result_id = insert_result(conn, data)
-        conn.commit()
-    finally:
-        conn.close()
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    result_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
     return result_id
-
-
-IMPORT_TEXT_COLUMNS = [
-    "student_name", "roll_number", "exam_name", "subject",
-    "question", "model_answer", "student_answer",
-]
-IMPORT_NUMBER_COLUMNS = ["max_marks", "similarity", "suggested_marks"]
-IMPORT_REQUIRED = IMPORT_TEXT_COLUMNS + IMPORT_NUMBER_COLUMNS
-
-
-def import_results(df):
-    """Imports rows from a CSV exported by this app.
-    Returns (added, skipped_duplicates, invalid_rows)."""
-    added = skipped = invalid = 0
-    conn = get_connection()
-    try:
-        for _, row in df.iterrows():
-            try:
-                data = {c: str(row[c]).strip() for c in IMPORT_TEXT_COLUMNS}
-                if not all(data.values()):
-                    raise ValueError("empty text field")
-                for c in IMPORT_NUMBER_COLUMNS:
-                    data[c] = float(row[c])
-                if data["max_marks"] <= 0:
-                    raise ValueError("max marks must be positive")
-            except (ValueError, KeyError):
-                invalid += 1
-                continue
-
-            created_at = str(row.get("created_at", "")).strip() or None
-            feedback = str(row.get("teacher_feedback", "")).strip()
-
-            final_marks = None
-            final_raw = str(row.get("final_marks", "")).strip()
-            if final_raw:
-                try:
-                    value = float(final_raw)
-                    if 0 <= value <= data["max_marks"]:
-                        final_marks = value
-                except ValueError:
-                    pass
-
-            duplicate = None
-            if created_at:
-                duplicate = conn.execute("""
-                    SELECT id FROM answer_sheet_results
-                    WHERE student_name = ? AND roll_number = ?
-                      AND exam_name = ? AND subject = ?
-                      AND question = ? AND student_answer = ?
-                      AND created_at = ?
-                """, (
-                    data["student_name"], data["roll_number"],
-                    data["exam_name"], data["subject"],
-                    data["question"], data["student_answer"], created_at
-                )).fetchone()
-
-            if duplicate:
-                skipped += 1
-                continue
-
-            insert_result(conn, data, created_at, final_marks, feedback)
-            added += 1
-
-        conn.commit()
-    finally:
-        conn.close()
-    return added, skipped, invalid
 
 
 def get_rechecks():
@@ -533,18 +413,12 @@ def delete_all_data():
     """Deletes all data and restarts IDs from 1."""
     conn = get_connection()
     try:
-        if USE_PG:
-            conn.execute(
-                "TRUNCATE answer_sheet_rechecks, answer_sheet_results "
-                "RESTART IDENTITY"
-            )
-        else:
-            conn.execute("DELETE FROM answer_sheet_rechecks")
-            conn.execute("DELETE FROM answer_sheet_results")
-            conn.execute(
-                "DELETE FROM sqlite_sequence WHERE name IN "
-                "('answer_sheet_results', 'answer_sheet_rechecks')"
-            )
+        conn.execute("DELETE FROM answer_sheet_rechecks")
+        conn.execute("DELETE FROM answer_sheet_results")
+        conn.execute(
+            "DELETE FROM sqlite_sequence WHERE name IN "
+            "('answer_sheet_results', 'answer_sheet_rechecks')"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -678,24 +552,7 @@ def render_result_sheet(result, show_answers=False):
 
 # ---------------- INITIALIZE APP ----------------
 
-@st.cache_resource(show_spinner=False)
-def init_db_once():
-    initialize_database()
-    return True
-
-
-try:
-    if USE_PG:
-        init_db_once()
-    else:
-        initialize_database()
-except Exception as exc:
-    print(f"Database connection error: {exc!r}")
-    st.error(
-        "Could not connect to the database. Please check the DATABASE_URL "
-        "secret and try again."
-    )
-    st.stop()
+initialize_database()
 
 if "teacher_logged_in" not in st.session_state:
     st.session_state.teacher_logged_in = False
@@ -720,6 +577,7 @@ page = st.sidebar.radio(
 
 st.sidebar.divider()
 st.sidebar.caption("Checking and rechecking, in one place.")
+st.sidebar.caption(f"DB: {DB_PATH} | rows: {len(get_results())}")
 
 
 # ---------------- HOME ----------------
@@ -995,12 +853,6 @@ elif page == "Teacher Panel":
             st.session_state.teacher_logged_in = False
             st.rerun()
 
-        st.caption(
-            "Database: Postgres (permanent cloud database)"
-            if USE_PG else
-            "Database: local SQLite file (not permanent on cloud hosting)"
-        )
-
         st.subheader("Rechecking requests")
 
         requests = get_rechecks()
@@ -1095,48 +947,6 @@ elif page == "Teacher Panel":
                 file_name="answer_sheet_results_backup.csv",
                 mime="text/csv"
             )
-
-        st.divider()
-        st.subheader("Import results from CSV")
-        st.caption(
-            "Use a CSV downloaded from this app (Download all results). "
-            "Rows already in the database are skipped. Recheck requests "
-            "are not included in the CSV."
-        )
-
-        import_msg = st.session_state.pop("import_msg", None)
-        if import_msg:
-            st.success(import_msg)
-
-        uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
-
-        if uploaded is not None:
-            try:
-                import_df = pd.read_csv(
-                    uploaded, dtype=str, keep_default_na=False,
-                    encoding="utf-8-sig"
-                )
-            except Exception:
-                import_df = None
-                st.error("Could not read this file. Please upload a valid CSV.")
-
-            if import_df is not None:
-                missing_cols = [
-                    c for c in IMPORT_REQUIRED if c not in import_df.columns
-                ]
-                if missing_cols:
-                    st.error("Missing columns: " + ", ".join(missing_cols))
-                else:
-                    st.write(f"{len(import_df)} row(s) found. Preview:")
-                    show_df(import_df.head(5))
-                    if st.button("Import these rows"):
-                        added, skipped, invalid = import_results(import_df)
-                        st.session_state.import_msg = (
-                            f"Imported {added} row(s). "
-                            f"Skipped {skipped} duplicate(s). "
-                            f"{invalid} invalid row(s) ignored."
-                        )
-                        st.rerun()
 
         st.divider()
         st.subheader("Delete data")
